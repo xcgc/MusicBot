@@ -23,10 +23,14 @@ import com.sedmelluq.discord.lavaplayer.player.event.AudioEventAdapter;
 import com.sedmelluq.discord.lavaplayer.track.AudioTrack;
 import com.sedmelluq.discord.lavaplayer.track.AudioTrackEndReason;
 import com.sedmelluq.discord.lavaplayer.track.playback.AudioFrame;
+import java.net.URL;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import com.jagrosh.jmusicbot.queue.FairQueue;
 import com.jagrosh.jmusicbot.settings.Settings;
 import com.jagrosh.jmusicbot.utils.FormatUtil;
@@ -39,6 +43,8 @@ import net.dv8tion.jda.api.audio.AudioSendHandler;
 import net.dv8tion.jda.api.entities.Guild;
 import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.entities.User;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  *
@@ -55,6 +61,12 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
     private final long guildId;
     
     private AudioFrame lastFrame;
+    private AudioTrack lastPlayedTrack = null;
+    private int lastPlayedTrackAttempts = 0;
+    private ScheduledFuture<?> replayTrackTimer = null;
+    
+    private final int maximumPlayAttempts = 3;
+    private final int replayDelayMS = 500;
 
     protected AudioHandler(PlayerManager manager, Guild guild, AudioPlayer player)
     {
@@ -65,9 +77,9 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
 
     public int addTrackToFront(QueuedTrack qtrack)
     {
-        if(audioPlayer.getPlayingTrack()==null)
+        if(getPlayingTrack()==null)
         {
-            audioPlayer.playTrack(qtrack.getTrack());
+            playTrackRobustly(qtrack.getTrack());
             return -1;
         }
         else
@@ -79,9 +91,9 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
     
     public int addTrack(QueuedTrack qtrack)
     {
-        if(audioPlayer.getPlayingTrack()==null)
+        if(getPlayingTrack()==null)
         {
-            audioPlayer.playTrack(qtrack.getTrack());
+            playTrackRobustly(qtrack.getTrack());
             return -1;
         }
         else
@@ -98,12 +110,12 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
         queue.clear();
         defaultQueue.clear();
         audioPlayer.stopTrack();
-        //current = null;
+        cancelScheduledTrackReplay();
     }
     
     public boolean isMusicPlaying(JDA jda)
     {
-        return guild(jda).getSelfMember().getVoiceState().inVoiceChannel() && audioPlayer.getPlayingTrack()!=null;
+        return guild(jda).getSelfMember().getVoiceState().inVoiceChannel() && getPlayingTrack()!=null;
     }
     
     public Set<String> getVotes()
@@ -118,9 +130,9 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
     
     public RequestMetadata getRequestMetadata()
     {
-        if(audioPlayer.getPlayingTrack() == null)
+        if(getPlayingTrack() == null)
             return RequestMetadata.EMPTY;
-        RequestMetadata rm = audioPlayer.getPlayingTrack().getUserData(RequestMetadata.class);
+        RequestMetadata rm = getPlayingTrack().getUserData(RequestMetadata.class);
         return rm == null ? RequestMetadata.EMPTY : rm;
     }
     
@@ -128,7 +140,7 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
     {
         if(!defaultQueue.isEmpty())
         {
-            audioPlayer.playTrack(defaultQueue.remove(0));
+            playTrackRobustly(defaultQueue.remove(0));
             return true;
         }
         Settings settings = manager.getBot().getSettingsManager().getSettings(guildId);
@@ -140,8 +152,8 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
             return false;
         pl.loadTracks(manager, (at) -> 
         {
-            if(audioPlayer.getPlayingTrack()==null)
-                audioPlayer.playTrack(at);
+            if(getPlayingTrack()==null)
+                playTrackRobustly(at);
             else
                 defaultQueue.add(at);
         }, () -> 
@@ -156,6 +168,22 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
     @Override
     public void onTrackEnd(AudioPlayer player, AudioTrack track, AudioTrackEndReason endReason) 
     {
+        Logger log = LoggerFactory.getLogger("AudioHandler");
+        log.info("Track " + track.getIdentifier() + " ended with reason: " + endReason);
+        
+        if (endReason==AudioTrackEndReason.LOAD_FAILED && isYouTubeTrack(track))
+        {
+            if (lastPlayedTrackAttempts>=maximumPlayAttempts)
+                log.info("Track ended with LOAD_FAILED. Not attempting to replay track");
+            else
+            {
+                lastPlayedTrackAttempts += 1;
+                log.info("Track ended with LOAD_FAILED. Replaying track after delay, attempts=" + lastPlayedTrackAttempts);
+                replayCurrentTrackAfterDelay();
+                return;
+            }
+        }
+        
         RepeatMode repeatMode = manager.getBot().getSettingsManager().getSettings(guildId).getRepeatMode();
         // if the track ended normally, and we're in repeat mode, re-add it to the queue
         if(endReason==AudioTrackEndReason.FINISHED && repeatMode != RepeatMode.OFF)
@@ -182,13 +210,16 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
         else
         {
             QueuedTrack qt = queue.pull();
-            player.playTrack(qt.getTrack());
+            playTrackRobustly(qt.getTrack());
         }
     }
 
     @Override
     public void onTrackStart(AudioPlayer player, AudioTrack track) 
     {
+        Logger log = LoggerFactory.getLogger("AudioHandler");
+        log.info("Track " + track.getIdentifier() + " started");
+        
         votes.clear();
         manager.getBot().getNowplayingHandler().onTrackUpdate(guildId, track, this);
     }
@@ -200,7 +231,7 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
         if(isMusicPlaying(jda))
         {
             Guild guild = guild(jda);
-            AudioTrack track = audioPlayer.getPlayingTrack();
+            AudioTrack track = getPlayingTrack();
             MessageBuilder mb = new MessageBuilder();
             mb.append(FormatUtil.filter(manager.getBot().getConfig().getSuccess()+" **Now Playing in "+guild.getSelfMember().getVoiceState().getChannel().getAsMention()+"...**"));
             EmbedBuilder eb = new EmbedBuilder();
@@ -232,7 +263,7 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
             if(track.getInfo().author != null && !track.getInfo().author.isEmpty())
                 eb.setFooter("Source: " + track.getInfo().author, null);
 
-            double progress = (double)audioPlayer.getPlayingTrack().getPosition()/track.getDuration();
+            double progress = (double)getPlayingTrack().getPosition()/track.getDuration();
             eb.setDescription((audioPlayer.isPaused() ? JMusicBot.PAUSE_EMOJI : JMusicBot.PLAY_EMOJI)
                     + " "+FormatUtil.progressBar(progress)
                     + " `[" + FormatUtil.formatTime(track.getPosition()) + "/" + FormatUtil.formatTime(track.getDuration()) + "]` "
@@ -260,7 +291,7 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
         if(isMusicPlaying(jda))
         {
             long userid = getRequestMetadata().getOwner();
-            AudioTrack track = audioPlayer.getPlayingTrack();
+            AudioTrack track = getPlayingTrack();
             String title = track.getInfo().title;
             if(title==null || title.equals("Unknown Title"))
                 title = track.getInfo().uri;
@@ -318,5 +349,65 @@ public class AudioHandler extends AudioEventAdapter implements AudioSendHandler
     private Guild guild(JDA jda)
     {
         return jda.getGuildById(guildId);
+    }
+    
+    private void playTrackRobustly(AudioTrack track)
+    {
+        lastPlayedTrack = track;
+        lastPlayedTrackAttempts = 1;
+        audioPlayer.playTrack(track);
+    }
+    
+    private void replayCurrentTrackAfterDelay()
+    {
+        cancelScheduledTrackReplay();
+        
+        Runnable task = () -> {
+            replayTrackTimer = null;
+            
+            if (lastPlayedTrack != null) {
+                lastPlayedTrack = lastPlayedTrack.makeClone();
+                audioPlayer.playTrack(lastPlayedTrack);
+            }
+        };
+        
+        replayTrackTimer = manager.getBot().getThreadpool().schedule(task, replayDelayMS, TimeUnit.MILLISECONDS);
+    }
+    
+    private void cancelScheduledTrackReplay()
+    {
+        if (replayTrackTimer != null && !replayTrackTimer.isDone())
+            replayTrackTimer.cancel(false);
+        
+        replayTrackTimer = null;
+    }
+    
+    private AudioTrack getPlayingTrack()
+    {
+        AudioTrack result = audioPlayer.getPlayingTrack();
+        
+        if (result!=null)
+            return result;
+        
+        if (replayTrackTimer!=null && !replayTrackTimer.isDone())
+            return lastPlayedTrack;
+        
+        return null;
+    }
+    
+    private boolean isYouTubeTrack(AudioTrack track)
+    {
+        URL trackURL;
+        
+        try
+        {
+            trackURL = new URL(track.getInfo().uri);
+        }
+        catch(Exception e)
+        {
+            return false;
+        }
+        
+        return (trackURL.getHost() == "youtube.com" || trackURL.getHost().endsWith(".youtube.com"));
     }
 }
